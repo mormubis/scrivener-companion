@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import Fastify from "fastify";
@@ -6,9 +7,13 @@ import { Embedder } from "./embedder.js";
 import {
   openVectorDb,
   insertChunk,
-  deleteDocumentChunks,
+  deleteChunkById,
   searchSimilar,
-  hasDocumentChunks,
+  getDocumentModifiedAt,
+  upsertDocumentIndex,
+  getIndexedDocumentUuids,
+  removeDocument,
+  getChunksByDocument,
   type VectorSearchResult,
 } from "./vector-store.js";
 import { parseScrivProject, type ParsedDocument } from "./parser/scrivx.js";
@@ -34,6 +39,10 @@ function chunkText(text: string): string[] {
   return chunks;
 }
 
+function hashChunk(text: string): string {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
 // ---------------------------------------------------------------------------
 // Project state
 // ---------------------------------------------------------------------------
@@ -54,29 +63,93 @@ async function indexProject(
   embedder: Embedder,
   documents: ParsedDocument[],
   force = false,
-): Promise<number> {
-  let totalChunks = 0;
+): Promise<{ embedded: number; skipped: number; deleted: number }> {
+  let embedded = 0;
+  let skipped = 0;
+  let deleted = 0;
 
-  for (const doc of documents) {
-    if (!force && hasDocumentChunks(state.vectorDb, doc.uuid)) {
-      continue;
-    }
+  // --- Phase 1: Delete orphaned documents ---
+  const currentUuids = new Set(documents.map((d) => d.uuid));
+  const indexedUuids = getIndexedDocumentUuids(state.vectorDb);
 
-    // Remove stale chunks before re-indexing
-    deleteDocumentChunks(state.vectorDb, doc.uuid);
-
-    const text = [doc.text, doc.notesText].filter(Boolean).join("\n\n");
-    if (!text.trim()) continue;
-
-    const chunks = chunkText(text);
-    for (let i = 0; i < chunks.length; i++) {
-      const embedding = await embedder.embed(chunks[i]);
-      insertChunk(state.vectorDb, doc.uuid, chunks[i], i, embedding);
-      totalChunks++;
+  for (const uuid of indexedUuids) {
+    if (!currentUuids.has(uuid)) {
+      removeDocument(state.vectorDb, uuid);
+      deleted++;
     }
   }
 
-  return totalChunks;
+  // --- Phase 2: Index new and modified documents ---
+  for (const doc of documents) {
+    const text = [doc.text, doc.notesText].filter(Boolean).join("\n\n");
+    if (!text.trim()) continue;
+
+    // Check if document needs re-indexing
+    if (!force) {
+      const storedModifiedAt = getDocumentModifiedAt(state.vectorDb, doc.uuid);
+      if (storedModifiedAt !== null && storedModifiedAt >= doc.modifiedAt) {
+        skipped++;
+        continue;
+      }
+    }
+
+    // Build new chunks with hashes
+    const newChunks = chunkText(text);
+    const newHashes = newChunks.map(hashChunk);
+
+    // Build a map of existing chunks by index for diffing
+    const existingChunks = getChunksByDocument(state.vectorDb, doc.uuid);
+    const existingByIndex = new Map(
+      existingChunks.map((c) => [c.chunk_index, c]),
+    );
+
+    // Track which existing chunk indices we've matched
+    const matchedIndices = new Set<number>();
+
+    for (let i = 0; i < newChunks.length; i++) {
+      const existing = existingByIndex.get(i);
+
+      if (existing && existing.content_hash === newHashes[i]) {
+        // Chunk unchanged — skip embedding
+        matchedIndices.add(i);
+        skipped++;
+        continue;
+      }
+
+      // Chunk is new or changed — delete old if exists, insert new
+      if (existing) {
+        deleteChunkById(state.vectorDb, existing.id);
+      }
+
+      const embedding = await embedder.embed(newChunks[i]);
+      insertChunk(
+        state.vectorDb,
+        doc.uuid,
+        newChunks[i],
+        i,
+        embedding,
+        newHashes[i],
+      );
+      embedded++;
+    }
+
+    // Delete trailing chunks that no longer exist
+    // (document got shorter — old chunks beyond new length)
+    for (const existing of existingChunks) {
+      if (
+        existing.chunk_index >= newChunks.length &&
+        !matchedIndices.has(existing.chunk_index)
+      ) {
+        deleteChunkById(state.vectorDb, existing.id);
+        deleted++;
+      }
+    }
+
+    // Update document index timestamp
+    upsertDocumentIndex(state.vectorDb, doc.uuid, doc.modifiedAt);
+  }
+
+  return { embedded, skipped, deleted };
 }
 
 // ---------------------------------------------------------------------------
@@ -148,8 +221,10 @@ async function main() {
     console.log(`[writer-memory] indexing ${name}...`);
     try {
       const { documents } = parseScrivProject(scrivPath);
-      const n = await indexProject(state, embedder, documents);
-      console.log(`[writer-memory] indexed ${n} chunks for ${name}`);
+      const stats = await indexProject(state, embedder, documents);
+      console.log(
+        `[writer-memory] indexed ${name}: ${stats.embedded} embedded, ${stats.skipped} skipped, ${stats.deleted} deleted`,
+      );
     } catch (err) {
       console.error(`[writer-memory] failed to index ${name}:`, err);
     }
@@ -219,14 +294,18 @@ async function main() {
 
   // POST /index — re-index all projects
   server.post("/index", async () => {
-    let total = 0;
+    const totals = { embedded: 0, skipped: 0, deleted: 0 };
     for (const project of projects) {
       console.log(`[writer-memory] re-indexing ${project.name}...`);
       try {
         const { documents } = parseScrivProject(project.scrivPath);
-        const n = await indexProject(project, embedder, documents, true);
-        total += n;
-        console.log(`[writer-memory] indexed ${n} chunks for ${project.name}`);
+        const stats = await indexProject(project, embedder, documents, true);
+        totals.embedded += stats.embedded;
+        totals.skipped += stats.skipped;
+        totals.deleted += stats.deleted;
+        console.log(
+          `[writer-memory] indexed ${project.name}: ${stats.embedded} embedded, ${stats.skipped} skipped, ${stats.deleted} deleted`,
+        );
       } catch (err) {
         console.error(
           `[writer-memory] failed to re-index ${project.name}:`,
@@ -234,7 +313,7 @@ async function main() {
         );
       }
     }
-    return { indexed: total };
+    return totals;
   });
 
   await server.listen({ port: PORT, host: "127.0.0.1" });

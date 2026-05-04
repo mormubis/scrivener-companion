@@ -24,6 +24,19 @@ export function openVectorDb(dbPath: string): Database.Database {
     )
   `);
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS document_index (
+      document_uuid TEXT PRIMARY KEY,
+      modified_at REAL NOT NULL
+    )
+  `);
+
+  const columns = db.prepare("PRAGMA table_info(chunks)").all() as { name: string }[];
+  const hasHash = columns.some((c) => c.name === "content_hash");
+  if (!hasHash) {
+    db.exec("ALTER TABLE chunks ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''");
+  }
+
   return db;
 }
 
@@ -33,12 +46,13 @@ export function insertChunk(
   chunkText: string,
   chunkIndex: number,
   embedding: Float32Array,
+  contentHash: string,
 ): void {
   const info = db
     .prepare(
-      "INSERT INTO chunks (document_uuid, chunk_text, chunk_index) VALUES (?, ?, ?)",
+      "INSERT INTO chunks (document_uuid, chunk_text, chunk_index, content_hash) VALUES (?, ?, ?, ?)",
     )
-    .run(documentUuid, chunkText, chunkIndex);
+    .run(documentUuid, chunkText, chunkIndex, contentHash);
 
   db.prepare(
     "INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, ?)",
@@ -90,4 +104,66 @@ export function hasDocumentChunks(
     .prepare("SELECT COUNT(*) as c FROM chunks WHERE document_uuid = ?")
     .get(uuid) as { c: number };
   return row.c > 0;
+}
+
+export function getDocumentModifiedAt(
+  db: Database.Database,
+  uuid: string,
+): number | null {
+  const row = db
+    .prepare("SELECT modified_at FROM document_index WHERE document_uuid = ?")
+    .get(uuid) as { modified_at: number } | undefined;
+  return row?.modified_at ?? null;
+}
+
+export function upsertDocumentIndex(
+  db: Database.Database,
+  uuid: string,
+  modifiedAt: number,
+): void {
+  db.prepare(
+    "INSERT INTO document_index (document_uuid, modified_at) VALUES (?, ?) ON CONFLICT(document_uuid) DO UPDATE SET modified_at = excluded.modified_at",
+  ).run(uuid, modifiedAt);
+}
+
+export function getIndexedDocumentUuids(
+  db: Database.Database,
+): Set<string> {
+  const rows = db
+    .prepare("SELECT document_uuid FROM document_index")
+    .all() as { document_uuid: string }[];
+  return new Set(rows.map((r) => r.document_uuid));
+}
+
+export function removeDocument(
+  db: Database.Database,
+  uuid: string,
+): void {
+  deleteDocumentChunks(db, uuid);
+  db.prepare("DELETE FROM document_index WHERE document_uuid = ?").run(uuid);
+}
+
+export interface StoredChunk {
+  id: number;
+  chunk_index: number;
+  content_hash: string;
+}
+
+export function getChunksByDocument(
+  db: Database.Database,
+  uuid: string,
+): StoredChunk[] {
+  return db
+    .prepare(
+      "SELECT id, chunk_index, content_hash FROM chunks WHERE document_uuid = ? ORDER BY chunk_index",
+    )
+    .all(uuid) as StoredChunk[];
+}
+
+export function deleteChunkById(
+  db: Database.Database,
+  chunkId: number,
+): void {
+  db.prepare("DELETE FROM chunk_vectors WHERE chunk_id = ?").run(chunkId);
+  db.prepare("DELETE FROM chunks WHERE id = ?").run(chunkId);
 }

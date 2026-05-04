@@ -1,0 +1,75 @@
+name: Build Companion
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-13
+            arch: x64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download ONNX model
+        run: node scripts/download-model.mjs
+
+      - name: Build SEA binary
+        run: node scripts/build-sea.mjs
+
+      - name: Verify binary starts
+        run: |
+          WRITER_MEMORY_SCRIV_PATH="" \
+          WRITER_MEMORY_MODEL_DIR="$(pwd)/model" \
+          ./dist/writer-memory-server-darwin-${{ matrix.arch }} &
+          PID=$!
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:52718/health)
+          kill $PID || true
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with status $STATUS"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: writer-memory-server-darwin-${{ matrix.arch }}
+          path: |
+            dist/writer-memory-server-darwin-${{ matrix.arch }}
+            dist/writer-memory-server-darwin-${{ matrix.arch }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            writer-memory-server-darwin-arm64/writer-memory-server-darwin-arm64
+            writer-memory-server-darwin-arm64/writer-memory-server-darwin-arm64.sha256
+            writer-memory-server-darwin-x64/writer-memory-server-darwin-x64
+            writer-memory-server-darwin-x64/writer-memory-server-darwin-x64.sha256

@@ -1,0 +1,25 @@
+{
+  "name": "scrivener-companion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sidecar binary for Writer's Memory Raycast extension",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build:server": "node scripts/build-server.mjs",
+    "build:sea": "node scripts/build-sea.mjs",
+    "download-model": "node scripts/download-model.mjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "better-sqlite3": "^11.0.0",
+    "fast-xml-parser": "^5.0.0",
+    "fastify": "^5.0.0",
+    "sqlite-vec": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0"
+  }
+}

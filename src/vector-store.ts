@@ -59,7 +59,7 @@ export function insertChunk(
   ).run(BigInt(info.lastInsertRowid), embedding);
 }
 
-export function deleteDocumentChunks(
+function deleteDocumentChunks(
   db: Database.Database,
   uuid: string,
 ): void {
@@ -96,15 +96,7 @@ export function searchSimilar(
     .all(queryEmbedding, topK) as VectorSearchResult[];
 }
 
-export function hasDocumentChunks(
-  db: Database.Database,
-  uuid: string,
-): boolean {
-  const row = db
-    .prepare("SELECT COUNT(*) as c FROM chunks WHERE document_uuid = ?")
-    .get(uuid) as { c: number };
-  return row.c > 0;
-}
+
 
 export function getDocumentModifiedAt(
   db: Database.Database,

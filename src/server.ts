@@ -103,15 +103,11 @@ async function indexProject(
       existingChunks.map((c) => [c.chunk_index, c]),
     );
 
-    // Track which existing chunk indices we've matched
-    const matchedIndices = new Set<number>();
-
     for (let i = 0; i < newChunks.length; i++) {
       const existing = existingByIndex.get(i);
 
       if (existing && existing.content_hash === newHashes[i]) {
         // Chunk unchanged — skip embedding
-        matchedIndices.add(i);
         skipped++;
         continue;
       }
@@ -136,10 +132,7 @@ async function indexProject(
     // Delete trailing chunks that no longer exist
     // (document got shorter — old chunks beyond new length)
     for (const existing of existingChunks) {
-      if (
-        existing.chunk_index >= newChunks.length &&
-        !matchedIndices.has(existing.chunk_index)
-      ) {
+      if (existing.chunk_index >= newChunks.length) {
         deleteChunkById(state.vectorDb, existing.id);
         deleted++;
       }

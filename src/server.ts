@@ -1,47 +1,21 @@
 import { DatabaseSync } from "node:sqlite";
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import Fastify from "fastify";
-import { Embedder } from "./embedder.js";
 import {
-  openVectorDb,
-  insertChunk,
-  deleteChunkById,
+  ingest,
+  walk,
+  Embedder,
+  openDb,
   searchSimilar,
   getDocumentModifiedAt,
-  upsertDocumentIndex,
   getIndexedDocumentUuids,
   removeDocument,
-  getChunksByDocument,
   type VectorSearchResult,
-} from "./vector-store.js";
-import { parseScrivProject, type ParsedDocument } from "./parser/scrivx.js";
+} from "./ingest/index.js";
 import type Database from "better-sqlite3";
 
 const PORT = 52718;
-const CHUNK_SIZE = 500;
-const CHUNK_OVERLAP = 100;
-
-// ---------------------------------------------------------------------------
-// Chunking
-// ---------------------------------------------------------------------------
-
-function chunkText(text: string): string[] {
-  const chunks: string[] = [];
-  let start = 0;
-  while (start < text.length) {
-    const end = Math.min(start + CHUNK_SIZE, text.length);
-    chunks.push(text.slice(start, end));
-    if (end === text.length) break;
-    start += CHUNK_SIZE - CHUNK_OVERLAP;
-  }
-  return chunks;
-}
-
-function hashChunk(text: string): string {
-  return crypto.createHash("sha256").update(text).digest("hex");
-}
 
 // ---------------------------------------------------------------------------
 // Project state
@@ -55,18 +29,19 @@ interface ProjectState {
 }
 
 // ---------------------------------------------------------------------------
-// Indexing
+// Indexing (delta orchestration)
 // ---------------------------------------------------------------------------
 
 async function indexProject(
   state: ProjectState,
   embedder: Embedder,
-  documents: ParsedDocument[],
   force = false,
 ): Promise<{ embedded: number; skipped: number; deleted: number }> {
   let embedded = 0;
   let skipped = 0;
   let deleted = 0;
+
+  const { documents } = walk(state.scrivPath);
 
   // --- Phase 1: Delete orphaned documents ---
   const currentUuids = new Set(documents.map((d) => d.uuid));
@@ -79,12 +54,8 @@ async function indexProject(
     }
   }
 
-  // --- Phase 2: Index new and modified documents ---
+  // --- Phase 2: Ingest new and modified documents ---
   for (const doc of documents) {
-    const text = [doc.text, doc.notesText].filter(Boolean).join("\n\n");
-    if (!text.trim()) continue;
-
-    // Check if document needs re-indexing
     if (!force) {
       const storedModifiedAt = getDocumentModifiedAt(state.vectorDb, doc.uuid);
       if (storedModifiedAt !== null && storedModifiedAt >= doc.modifiedAt) {
@@ -93,53 +64,9 @@ async function indexProject(
       }
     }
 
-    // Build new chunks with hashes
-    const newChunks = chunkText(text);
-    const newHashes = newChunks.map(hashChunk);
-
-    // Build a map of existing chunks by index for diffing
-    const existingChunks = getChunksByDocument(state.vectorDb, doc.uuid);
-    const existingByIndex = new Map(
-      existingChunks.map((c) => [c.chunk_index, c]),
-    );
-
-    for (let i = 0; i < newChunks.length; i++) {
-      const existing = existingByIndex.get(i);
-
-      if (existing && existing.content_hash === newHashes[i]) {
-        // Chunk unchanged — skip embedding
-        skipped++;
-        continue;
-      }
-
-      // Chunk is new or changed — delete old if exists, insert new
-      if (existing) {
-        deleteChunkById(state.vectorDb, existing.id);
-      }
-
-      const embedding = await embedder.embed(newChunks[i]);
-      insertChunk(
-        state.vectorDb,
-        doc.uuid,
-        newChunks[i],
-        i,
-        embedding,
-        newHashes[i],
-      );
-      embedded++;
-    }
-
-    // Delete trailing chunks that no longer exist
-    // (document got shorter — old chunks beyond new length)
-    for (const existing of existingChunks) {
-      if (existing.chunk_index >= newChunks.length) {
-        deleteChunkById(state.vectorDb, existing.id);
-        deleted++;
-      }
-    }
-
-    // Update document index timestamp
-    upsertDocumentIndex(state.vectorDb, doc.uuid, doc.modifiedAt);
+    const result = await ingest(doc, embedder, state.vectorDb);
+    embedded += result.embedded;
+    skipped += result.skipped;
   }
 
   return { embedded, skipped, deleted };
@@ -206,15 +133,14 @@ async function main() {
     const ftsDbPath = path.join(memoryDir, "index.db");
     const name = path.basename(scrivPath, ".scriv");
 
-    const vectorDb = openVectorDb(vectorDbPath);
+    const vectorDb = openDb(vectorDbPath);
 
     const state: ProjectState = { name, scrivPath, vectorDb, ftsDbPath };
     projects.push(state);
 
     console.log(`[writer-memory] indexing ${name}...`);
     try {
-      const { documents } = parseScrivProject(scrivPath);
-      const stats = await indexProject(state, embedder, documents);
+      const stats = await indexProject(state, embedder);
       console.log(
         `[writer-memory] indexed ${name}: ${stats.embedded} embedded, ${stats.skipped} skipped, ${stats.deleted} deleted`,
       );
@@ -280,7 +206,6 @@ async function main() {
       }
     }
 
-    // Sort by distance across all projects, return topK overall
     results.sort((a, b) => a.distance - b.distance);
     return results.slice(0, topK);
   });
@@ -291,8 +216,7 @@ async function main() {
     for (const project of projects) {
       console.log(`[writer-memory] re-indexing ${project.name}...`);
       try {
-        const { documents } = parseScrivProject(project.scrivPath);
-        const stats = await indexProject(project, embedder, documents, true);
+        const stats = await indexProject(project, embedder, true);
         totals.embedded += stats.embedded;
         totals.skipped += stats.skipped;
         totals.deleted += stats.deleted;

@@ -1,4 +1,3 @@
-import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import Fastify from "fastify";
@@ -11,21 +10,33 @@ import {
   getDocumentModifiedAt,
   getIndexedDocumentUuids,
   removeDocument,
+  lookupDocMeta,
   type VectorSearchResult,
 } from "./ingest/index.js";
+import {
+  paths,
+  ensureDirs,
+  listProjects,
+  addProject,
+  removeProject,
+  type ProjectEntry,
+} from "./config.js";
 import type Database from "better-sqlite3";
 
-const PORT = 52718;
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+type ServerState = "starting" | "indexing" | "ready" | "stopping";
+let state: ServerState = "starting";
 
 // ---------------------------------------------------------------------------
 // Project state
 // ---------------------------------------------------------------------------
 
 interface ProjectState {
-  name: string;
-  scrivPath: string;
-  vectorDb: Database.Database;
-  ftsDbPath: string;
+  entry: ProjectEntry;
+  db: Database.Database;
 }
 
 // ---------------------------------------------------------------------------
@@ -33,7 +44,7 @@ interface ProjectState {
 // ---------------------------------------------------------------------------
 
 async function indexProject(
-  state: ProjectState,
+  project: ProjectState,
   embedder: Embedder,
   force = false,
 ): Promise<{ embedded: number; skipped: number; deleted: number }> {
@@ -41,30 +52,30 @@ async function indexProject(
   let skipped = 0;
   let deleted = 0;
 
-  const { documents } = walk(state.scrivPath);
+  const { documents } = walk(project.entry.path);
 
-  // --- Phase 1: Delete orphaned documents ---
+  // Phase 1: Delete orphaned documents
   const currentUuids = new Set(documents.map((d) => d.uuid));
-  const indexedUuids = getIndexedDocumentUuids(state.vectorDb);
+  const indexedUuids = getIndexedDocumentUuids(project.db);
 
   for (const uuid of indexedUuids) {
     if (!currentUuids.has(uuid)) {
-      removeDocument(state.vectorDb, uuid);
+      removeDocument(project.db, uuid);
       deleted++;
     }
   }
 
-  // --- Phase 2: Ingest new and modified documents ---
+  // Phase 2: Ingest new and modified documents
   for (const doc of documents) {
     if (!force) {
-      const storedModifiedAt = getDocumentModifiedAt(state.vectorDb, doc.uuid);
+      const storedModifiedAt = getDocumentModifiedAt(project.db, doc.uuid);
       if (storedModifiedAt !== null && storedModifiedAt >= doc.modifiedAt) {
         skipped++;
         continue;
       }
     }
 
-    const result = await ingest(doc, embedder, state.vectorDb);
+    const result = await ingest(doc, embedder, project.db);
     embedded += result.embedded;
     skipped += result.skipped;
   }
@@ -73,91 +84,93 @@ async function indexProject(
 }
 
 // ---------------------------------------------------------------------------
-// Metadata lookup from FTS5 index.db
+// Lifecycle
 // ---------------------------------------------------------------------------
 
-interface DocMeta {
-  title: string;
-  binder_path: string;
-  binder_section: string;
-  deep_link: string | null;
+function acquireLock(): number {
+  ensureDirs();
+  const fd = fs.openSync(paths.lock, "w");
+  fs.writeFileSync(paths.lock, String(process.pid) + "\n");
+  return fd;
 }
 
-function lookupDocMeta(ftsDbPath: string, uuid: string): DocMeta | null {
-  if (!fs.existsSync(ftsDbPath)) return null;
-  const db = new DatabaseSync(ftsDbPath);
-  try {
-    const row = db
-      .prepare(
-        "SELECT title, binder_path, binder_section, deep_link FROM documents WHERE uuid = ?",
-      )
-      .get(uuid) as DocMeta | undefined;
-    return row ?? null;
-  } finally {
-    db.close();
-  }
+function writePid(): void {
+  fs.writeFileSync(paths.pid, String(process.pid) + "\n");
+}
+
+function cleanup(): void {
+  try { fs.unlinkSync(paths.sock); } catch {}
+  try { fs.unlinkSync(paths.pid); } catch {}
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
-async function main() {
-  const scrivPaths = (process.env.WRITER_MEMORY_SCRIV_PATH ?? "")
-    .split(",")
-    .map((p) => p.trim())
-    .filter(Boolean);
+export async function main() {
+  // Acquire lock and set up lifecycle
+  acquireLock();
 
+  // Clean up stale socket from previous crash
+  if (fs.existsSync(paths.sock)) {
+    fs.unlinkSync(paths.sock);
+  }
+
+  writePid();
+  ensureDirs();
+
+  // HTTP server (created early so shutdown handler can reference it)
+  const server = Fastify({ logger: false });
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    if (state === "stopping") return;
+    state = "stopping";
+    console.log("[scrivener-companion] shutting down...");
+    await server.close();
+    cleanup();
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+
+  // Load embedder
   const modelDir = process.env.WRITER_MEMORY_MODEL_DIR ?? "";
-
   if (!modelDir) {
     throw new Error("WRITER_MEMORY_MODEL_DIR is required");
   }
 
-  // Initialize embedder
   const embedder = new Embedder(modelDir);
   await embedder.initialize();
 
-  // Initialize project states and initial index
+  // Index all registered projects
+  state = "indexing";
   const projects: ProjectState[] = [];
 
-  for (const scrivPath of scrivPaths) {
-    const projectDir = path.dirname(scrivPath);
-    const memoryDir = path.join(projectDir, ".memory");
+  for (const entry of listProjects()) {
+    const db = openDb(entry.dbPath);
+    const project: ProjectState = { entry, db };
+    projects.push(project);
 
-    if (!fs.existsSync(memoryDir)) {
-      fs.mkdirSync(memoryDir, { recursive: true });
-    }
-
-    const vectorDbPath = path.join(memoryDir, "vectors.db");
-    const ftsDbPath = path.join(memoryDir, "index.db");
-    const name = path.basename(scrivPath, ".scriv");
-
-    const vectorDb = openDb(vectorDbPath);
-
-    const state: ProjectState = { name, scrivPath, vectorDb, ftsDbPath };
-    projects.push(state);
-
-    console.log(`[writer-memory] indexing ${name}...`);
+    console.log(`[scrivener-companion] indexing ${entry.name}...`);
     try {
-      const stats = await indexProject(state, embedder);
+      const stats = await indexProject(project, embedder);
       console.log(
-        `[writer-memory] indexed ${name}: ${stats.embedded} embedded, ${stats.skipped} skipped, ${stats.deleted} deleted`,
+        `[scrivener-companion] indexed ${entry.name}: ${stats.embedded} embedded, ${stats.skipped} skipped, ${stats.deleted} deleted`,
       );
     } catch (err) {
-      console.error(`[writer-memory] failed to index ${name}:`, err);
+      console.error(`[scrivener-companion] failed to index ${entry.name}:`, err);
     }
   }
 
   // ---------------------------------------------------------------------------
-  // HTTP server
+  // Routes
   // ---------------------------------------------------------------------------
-
-  const server = Fastify({ logger: false });
 
   // GET /health
   server.get("/health", async () => {
-    return { status: "ok" };
+    return { status: "ok", state };
   });
 
   // POST /search
@@ -186,13 +199,13 @@ async function main() {
     for (const project of projects) {
       let hits: VectorSearchResult[];
       try {
-        hits = searchSimilar(project.vectorDb, queryEmbedding, topK);
+        hits = searchSimilar(project.db, queryEmbedding, topK);
       } catch {
         hits = [];
       }
 
       for (const hit of hits) {
-        const meta = lookupDocMeta(project.ftsDbPath, hit.document_uuid);
+        const meta = lookupDocMeta(project.db, hit.document_uuid);
         results.push({
           chunk_text: hit.chunk_text,
           document_uuid: hit.document_uuid,
@@ -201,7 +214,7 @@ async function main() {
           binder_section: meta?.binder_section ?? null,
           deep_link: meta?.deep_link ?? null,
           distance: hit.distance,
-          project: project.name,
+          project: project.entry.name,
         });
       }
     }
@@ -214,18 +227,18 @@ async function main() {
   server.post("/index", async () => {
     const totals = { embedded: 0, skipped: 0, deleted: 0 };
     for (const project of projects) {
-      console.log(`[writer-memory] re-indexing ${project.name}...`);
+      console.log(`[scrivener-companion] re-indexing ${project.entry.name}...`);
       try {
         const stats = await indexProject(project, embedder, true);
         totals.embedded += stats.embedded;
         totals.skipped += stats.skipped;
         totals.deleted += stats.deleted;
         console.log(
-          `[writer-memory] indexed ${project.name}: ${stats.embedded} embedded, ${stats.skipped} skipped, ${stats.deleted} deleted`,
+          `[scrivener-companion] indexed ${project.entry.name}: ${stats.embedded} embedded, ${stats.skipped} skipped, ${stats.deleted} deleted`,
         );
       } catch (err) {
         console.error(
-          `[writer-memory] failed to re-index ${project.name}:`,
+          `[scrivener-companion] failed to re-index ${project.entry.name}:`,
           err,
         );
       }
@@ -233,11 +246,88 @@ async function main() {
     return totals;
   });
 
-  await server.listen({ port: PORT, host: "127.0.0.1" });
-  console.log(`[writer-memory] service running on port ${PORT}`);
+  // GET /projects
+  server.get("/projects", async () => {
+    return projects.map((p) => ({
+      slug: p.entry.slug,
+      path: p.entry.path,
+      name: p.entry.name,
+    }));
+  });
+
+  // POST /projects
+  server.post<{
+    Body: { path: string };
+  }>("/projects", async (request, reply) => {
+    const { path: scrivPath } = request.body;
+
+    if (!scrivPath || typeof scrivPath !== "string") {
+      return reply.status(400).send({ error: "path is required" });
+    }
+
+    // Check if already registered
+    const existing = projects.find((p) => p.entry.path === path.resolve(scrivPath));
+    if (existing) {
+      return reply.status(409).send({ error: "project already registered", slug: existing.entry.slug });
+    }
+
+    let entry: ProjectEntry;
+    try {
+      entry = addProject(scrivPath);
+    } catch (err) {
+      return reply.status(400).send({ error: (err as Error).message });
+    }
+
+    const db = openDb(entry.dbPath);
+    const project: ProjectState = { entry, db };
+    projects.push(project);
+
+    // Trigger initial index
+    console.log(`[scrivener-companion] indexing ${entry.name}...`);
+    try {
+      const stats = await indexProject(project, embedder);
+      console.log(
+        `[scrivener-companion] indexed ${entry.name}: ${stats.embedded} embedded, ${stats.skipped} skipped, ${stats.deleted} deleted`,
+      );
+    } catch (err) {
+      console.error(`[scrivener-companion] failed to index ${entry.name}:`, err);
+    }
+
+    return reply.status(201).send({ slug: entry.slug, path: entry.path });
+  });
+
+  // DELETE /projects/:slug
+  server.delete<{
+    Params: { slug: string };
+  }>("/projects/:slug", async (request, reply) => {
+    const { slug } = request.params;
+
+    const idx = projects.findIndex((p) => p.entry.slug === slug);
+    if (idx === -1) {
+      return reply.status(404).send({ error: "project not found" });
+    }
+
+    // Close DB and remove from memory
+    projects[idx].db.close();
+    projects.splice(idx, 1);
+
+    // Remove from registry and delete DB file
+    const removed = removeProject(slug);
+    if (!removed) {
+      return reply.status(404).send({ error: "project not found in registry" });
+    }
+
+    return { slug, deleted: true };
+  });
+
+  // Listen on unix socket
+  await server.listen({ path: paths.sock });
+  state = "ready";
+  console.log(`[scrivener-companion] listening on ${paths.sock}`);
 }
 
 main().catch((err) => {
-  console.error("[writer-memory] fatal:", err);
+  console.error("[scrivener-companion] fatal:", err);
+  cleanup();
   process.exit(1);
 });

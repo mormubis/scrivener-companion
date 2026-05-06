@@ -3,7 +3,7 @@ import { walk } from "./walk.js";
 import { parse } from "./parse.js";
 import { chunk } from "./chunk.js";
 import { Embedder } from "./embed.js";
-import { insertChunk, deleteChunkById, getChunksByDocument, upsertDocumentIndex } from "./store.js";
+import { insertChunk, deleteChunkById, getChunksByDocument, upsertDocument } from "./store.js";
 import type { WalkedDocument } from "./walk.js";
 
 export interface IngestResult {
@@ -56,7 +56,19 @@ export async function ingest(
     }
   }
 
-  upsertDocumentIndex(db, doc.uuid, doc.modifiedAt);
+  upsertDocument(db, {
+    uuid: doc.uuid,
+    title: doc.title,
+    binderPath: doc.binderPath,
+    binderSection: doc.binderSection,
+    docType: doc.docType,
+    label: doc.label,
+    status: doc.status,
+    sectionType: doc.sectionType,
+    includeInCompile: doc.includeInCompile,
+    deepLink: doc.deepLink,
+    modifiedAt: doc.modifiedAt,
+  });
 
   return { embedded, skipped };
 }
@@ -75,9 +87,10 @@ export {
   deleteChunkById,
   searchSimilar,
   getDocumentModifiedAt,
-  upsertDocumentIndex,
+  upsertDocument,
   getIndexedDocumentUuids,
   removeDocument,
   getChunksByDocument,
+  lookupDocMeta,
 } from "./store.js";
-export type { VectorSearchResult, StoredChunk } from "./store.js";
+export type { VectorSearchResult, StoredChunk, DocMeta, DocumentMeta } from "./store.js";

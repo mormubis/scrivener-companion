@@ -4,12 +4,12 @@ import fs from "node:fs";
 fs.mkdirSync("dist", { recursive: true });
 
 await build({
-  entryPoints: ["src/server.ts"],
+  entryPoints: ["src/cli.ts"],
   bundle: true,
   platform: "node",
   target: "node22",
   format: "cjs",
-  outfile: "dist/server.js",
+  outfile: "dist/cli.js",
   external: [
     "better-sqlite3",
     "sqlite-vec",
@@ -18,4 +18,4 @@ await build({
   ],
 });
 
-console.log("Server bundle written to dist/server.js");
+console.log("CLI bundle written to dist/cli.js");

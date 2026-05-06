@@ -66,7 +66,7 @@ function extractNativeAssets(cacheDir: string): Map<string, string> {
 // ---------------------------------------------------------------------------
 
 if (!isSea()) {
-  import("./server.js");
+  import("./cli.js");
 } else {
   const cacheDir = getCacheDir();
   const assets = extractNativeAssets(cacheDir);
@@ -102,9 +102,9 @@ if (!isSea()) {
     process.env.ONNXRUNTIME_LIB_PATH = onnxLibPath;
   }
 
-  // Load and run the bundled server
-  const serverAsset = getAsset("server.js", "utf8");
-  const serverPath = path.join(cacheDir, "server.js");
+  // Load and run the bundled CLI
+  const serverAsset = getAsset("cli.js", "utf8");
+  const serverPath = path.join(cacheDir, "cli.js");
   if (!fs.existsSync(serverPath)) {
     fs.writeFileSync(serverPath, serverAsset);
   }

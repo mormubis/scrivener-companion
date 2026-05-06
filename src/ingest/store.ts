@@ -25,8 +25,17 @@ export function openDb(dbPath: string): Database.Database {
   `);
 
   db.exec(`
-    CREATE TABLE IF NOT EXISTS document_index (
-      document_uuid TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS documents (
+      uuid TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      binder_path TEXT NOT NULL,
+      binder_section TEXT NOT NULL,
+      doc_type TEXT NOT NULL,
+      label TEXT,
+      status TEXT,
+      section_type TEXT,
+      include_in_compile INTEGER NOT NULL DEFAULT 1,
+      deep_link TEXT NOT NULL,
       modified_at REAL NOT NULL
     )
   `);
@@ -35,6 +44,29 @@ export function openDb(dbPath: string): Database.Database {
   const hasHash = columns.some((c) => c.name === "content_hash");
   if (!hasHash) {
     db.exec("ALTER TABLE chunks ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''");
+  }
+
+  // Migrate from document_index to documents
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[];
+  const tableNames = new Set(tables.map((t) => t.name));
+  if (tableNames.has("document_index") && !tableNames.has("documents")) {
+    db.exec(`
+      CREATE TABLE documents (
+        uuid TEXT PRIMARY KEY,
+        title TEXT NOT NULL DEFAULT '',
+        binder_path TEXT NOT NULL DEFAULT '',
+        binder_section TEXT NOT NULL DEFAULT '',
+        doc_type TEXT NOT NULL DEFAULT '',
+        label TEXT,
+        status TEXT,
+        section_type TEXT,
+        include_in_compile INTEGER NOT NULL DEFAULT 1,
+        deep_link TEXT NOT NULL DEFAULT '',
+        modified_at REAL NOT NULL
+      )
+    `);
+    db.exec("INSERT INTO documents (uuid, modified_at, title, binder_path, binder_section, doc_type, deep_link) SELECT document_uuid, modified_at, '', '', '', '', '' FROM document_index");
+    db.exec("DROP TABLE document_index");
   }
 
   return db;
@@ -101,28 +133,68 @@ export function getDocumentModifiedAt(
   uuid: string,
 ): number | null {
   const row = db
-    .prepare("SELECT modified_at FROM document_index WHERE document_uuid = ?")
+    .prepare("SELECT modified_at FROM documents WHERE uuid = ?")
     .get(uuid) as { modified_at: number } | undefined;
   return row?.modified_at ?? null;
 }
 
-export function upsertDocumentIndex(
-  db: Database.Database,
-  uuid: string,
-  modifiedAt: number,
-): void {
-  db.prepare(
-    "INSERT INTO document_index (document_uuid, modified_at) VALUES (?, ?) ON CONFLICT(document_uuid) DO UPDATE SET modified_at = excluded.modified_at",
-  ).run(uuid, modifiedAt);
+export interface DocumentMeta {
+  uuid: string;
+  title: string;
+  binderPath: string;
+  binderSection: string;
+  docType: string;
+  label: string | null;
+  status: string | null;
+  sectionType: string | null;
+  includeInCompile: boolean;
+  deepLink: string;
+  modifiedAt: number;
+}
+
+export function upsertDocument(db: Database.Database, doc: DocumentMeta): void {
+  db.prepare(`
+    INSERT INTO documents (uuid, title, binder_path, binder_section, doc_type, label, status, section_type, include_in_compile, deep_link, modified_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(uuid) DO UPDATE SET
+      title = excluded.title,
+      binder_path = excluded.binder_path,
+      binder_section = excluded.binder_section,
+      doc_type = excluded.doc_type,
+      label = excluded.label,
+      status = excluded.status,
+      section_type = excluded.section_type,
+      include_in_compile = excluded.include_in_compile,
+      deep_link = excluded.deep_link,
+      modified_at = excluded.modified_at
+  `).run(
+    doc.uuid, doc.title, doc.binderPath, doc.binderSection, doc.docType,
+    doc.label, doc.status, doc.sectionType, doc.includeInCompile ? 1 : 0,
+    doc.deepLink, doc.modifiedAt,
+  );
+}
+
+export interface DocMeta {
+  title: string;
+  binder_path: string;
+  binder_section: string;
+  deep_link: string | null;
+}
+
+export function lookupDocMeta(db: Database.Database, uuid: string): DocMeta | null {
+  const row = db
+    .prepare("SELECT title, binder_path, binder_section, deep_link FROM documents WHERE uuid = ?")
+    .get(uuid) as DocMeta | undefined;
+  return row ?? null;
 }
 
 export function getIndexedDocumentUuids(
   db: Database.Database,
 ): Set<string> {
   const rows = db
-    .prepare("SELECT document_uuid FROM document_index")
-    .all() as { document_uuid: string }[];
-  return new Set(rows.map((r) => r.document_uuid));
+    .prepare("SELECT uuid FROM documents")
+    .all() as { uuid: string }[];
+  return new Set(rows.map((r) => r.uuid));
 }
 
 export function removeDocument(
@@ -130,7 +202,7 @@ export function removeDocument(
   uuid: string,
 ): void {
   deleteDocumentChunks(db, uuid);
-  db.prepare("DELETE FROM document_index WHERE document_uuid = ?").run(uuid);
+  db.prepare("DELETE FROM documents WHERE uuid = ?").run(uuid);
 }
 
 export interface StoredChunk {

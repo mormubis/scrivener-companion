@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import http from "node:http";
 import { paths, ensureDirs } from "./config.js";
 
@@ -83,9 +84,19 @@ async function start(): Promise<void> {
   cleanStaleFiles();
   ensureDirs();
 
-  const child = spawn(process.execPath, [...process.execArgv, process.argv[1], "--serve"], {
+  const logPath = path.join(paths.configDir, "server.log");
+  const logFd = fs.openSync(logPath, "a");
+
+  // In SEA context, process.execPath IS the binary — just pass --serve.
+  // In dev context (npx tsx), we need execPath + execArgv + script path + --serve.
+  const isSea = process.argv[1] === process.execPath || !process.argv[1];
+  const childArgs = isSea
+    ? ["--serve"]
+    : [...process.execArgv, process.argv[1], "--serve"];
+
+  const child = spawn(process.execPath, childArgs, {
     detached: true,
-    stdio: "ignore",
+    stdio: ["ignore", logFd, logFd],
     env: { ...process.env },
   });
 

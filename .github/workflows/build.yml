@@ -33,14 +33,13 @@ jobs:
       - name: Build SEA binary
         run: node scripts/build-sea.mjs
 
-      - name: Verify binary starts
+      - name: Verify binary runs
         run: |
-          WRITER_MEMORY_SCRIV_PATH="" \
           WRITER_MEMORY_MODEL_DIR="$(pwd)/model" \
-          ./dist/writer-memory-server-darwin-${{ matrix.arch }} &
+          ./dist/scrivener-companion-darwin-${{ matrix.arch }} --serve &
           PID=$!
-          sleep 5
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:52718/health)
+          sleep 10
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' --unix-socket ~/.config/scrivener-companion/server.sock http://localhost/health)
           kill $PID || true
           if [ "$STATUS" != "200" ]; then
             echo "Health check failed with status $STATUS"
@@ -50,10 +49,10 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: writer-memory-server-darwin-${{ matrix.arch }}
+          name: scrivener-companion-darwin-${{ matrix.arch }}
           path: |
-            dist/writer-memory-server-darwin-${{ matrix.arch }}
-            dist/writer-memory-server-darwin-${{ matrix.arch }}.sha256
+            dist/scrivener-companion-darwin-${{ matrix.arch }}
+            dist/scrivener-companion-darwin-${{ matrix.arch }}.sha256
 
   release:
     needs: build
@@ -69,7 +68,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            writer-memory-server-darwin-arm64/writer-memory-server-darwin-arm64
-            writer-memory-server-darwin-arm64/writer-memory-server-darwin-arm64.sha256
-            writer-memory-server-darwin-x64/writer-memory-server-darwin-x64
-            writer-memory-server-darwin-x64/writer-memory-server-darwin-x64.sha256
+            scrivener-companion-darwin-arm64/scrivener-companion-darwin-arm64
+            scrivener-companion-darwin-arm64/scrivener-companion-darwin-arm64.sha256
+            scrivener-companion-darwin-x64/scrivener-companion-darwin-x64
+            scrivener-companion-darwin-x64/scrivener-companion-darwin-x64.sha256
